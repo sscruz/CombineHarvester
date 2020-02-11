@@ -2,6 +2,7 @@ import os
 import stat
 from functools import partial
 from multiprocessing import Pool
+import grp 
 
 DRY_RUN = False
 
@@ -34,6 +35,20 @@ periodic_release =  (NumJobStarts < 3) && ((CurrentTime - EnteredCurrentStatus) 
 %(EXTRA)s
 queue %(NUMBER)s
 
+"""
+
+ARC_TEMPLATE= """
+&
+(executable="{EXE}")
+(arguments="{JOBID}")
+(stdout="{TASK}.o.txt")
+(stderr="{TASK}.e.txt")
+(outputFiles=
+   ("{TASK}_${JOBID}.o.txt" " ")
+   ("{TASK}_${JOBID}.e.txt" " ")
+)
+(inputFiles=
+)
 """
 
 CRAB_PREFIX = """
@@ -110,7 +125,7 @@ class CombineToolBase:
 
     def attach_job_args(self, group):
         group.add_argument('--job-mode', default=self.job_mode, choices=[
-                           'interactive', 'script', 'lxbatch', 'SGE', 'condor', 'crab3'], help='Task execution mode')
+                           'interactive', 'script', 'lxbatch', 'SGE', 'condor', 'crab3','arc'], help='Task execution mode')
         group.add_argument('--prefix-file', default=self.prefix_file,
                            help='Path to file containing job prefix')
         group.add_argument('--task-name', default=self.task_name,
@@ -248,6 +263,47 @@ class CombineToolBase:
                 full_script = os.path.abspath(script)
                 logname = full_script.replace('.sh', '_%J.log')
                 run_command(self.dry_run, 'qsub -o %s %s %s' % (logname, self.bopts, full_script))
+        if self.job_mode == 'arc':
+            outscriptname = 'arc_%s.sh' % self.task_name
+            subfilename = 'arc_%s.xrsl' % self.task_name
+            print '>> arc job script will be %s' % outscriptname
+            outscript = open(outscriptname, "w")
+            outscript.write(JOB_PREFIX)
+            jobs = 0
+            wsp_files = set()
+            for i, j in enumerate(range(0, len(self.job_queue), self.merge)):
+                outscript.write('\nif [ $1 -eq %i ]; then\n' % jobs)
+                jobs += 1
+                for line in self.job_queue[j:j + self.merge]:
+                    newline = self.pre_cmd + line
+                    wsp = str(self.extract_workspace_arg(newline.split()))
+                    wsp_files.add(wsp)
+                    outscript.write('  ' + newline + '\n')
+                outscript.write('fi')
+                subfile = open(subfilename.replace('.xrsl','_%d.xrsl'%jobs), "w")
+                print self.task_name
+                arc_settings = ARC_TEMPLATE .format(
+                    EXE  = outscriptname,
+                    JOBID= jobs-1,
+                    TASK = self.task_name,
+                )
+                subfile.write(arc_settings)
+                subfile.close()
+            # cannot ship them bc they will be to heavy, but we can give read access
+            for fil in wsp_files: 
+                print 'setting perms for', fil
+                st = os.stat(fil)
+                os.chown(fil, os.getuid(), grp.getgrnam('escms').gr_gid)
+                os.chmod(fil, st.st_mode | stat.S_IEXEC | stat.S_IRGRP | stat.S_IXGRP)
+            outscript.write('\n chmod g+rw *.root')
+            outscript.close()
+            st = os.stat(outscriptname)
+            os.chown(outscriptname, os.getuid(), grp.getgrnam('escms').gr_gid)
+            os.chmod(outscriptname, st.st_mode | stat.S_IEXEC | stat.S_IRGRP | stat.S_IXGRP)
+
+            for job in range(jobs):
+                run_command(self.dry_run, 'arcsub -c arcce01.ifca.es %s' % (subfilename.replace('.xrsl','_%d.xrsl'%(job+1))))
+
         if self.job_mode == 'condor':
             outscriptname = 'condor_%s.sh' % self.task_name
             subfilename = 'condor_%s.sub' % self.task_name
